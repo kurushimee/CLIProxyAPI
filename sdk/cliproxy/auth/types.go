@@ -472,23 +472,18 @@ func (a *Auth) ToolPrefixDisabled() bool {
 
 // RequestRetryOverride returns the auth-file scoped request_retry override when present.
 // The value is read from metadata key "request_retry" (or legacy "request-retry").
+// A negative value means unlimited request retries.
 func (a *Auth) RequestRetryOverride() (int, bool) {
 	if a == nil || a.Metadata == nil {
 		return 0, false
 	}
 	if val, ok := a.Metadata["request_retry"]; ok {
 		if parsed, okParse := parseIntAny(val); okParse {
-			if parsed < 0 {
-				parsed = 0
-			}
 			return parsed, true
 		}
 	}
 	if val, ok := a.Metadata["request-retry"]; ok {
 		if parsed, okParse := parseIntAny(val); okParse {
-			if parsed < 0 {
-				parsed = 0
-			}
 			return parsed, true
 		}
 	}

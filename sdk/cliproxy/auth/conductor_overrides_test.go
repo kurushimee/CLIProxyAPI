@@ -63,6 +63,111 @@ func TestManager_ShouldRetryAfterError_RespectsAuthRequestRetryOverride(t *testi
 	if shouldRetry {
 		t.Fatalf("expected shouldRetry=false on attempt=1 for request_retry=1, got true")
 	}
+
+	auth.Metadata["request_retry"] = float64(-1)
+	if _, errUpdate := m.Update(context.Background(), auth); errUpdate != nil {
+		t.Fatalf("update auth unlimited retry: %v", errUpdate)
+	}
+	wait, shouldRetry = m.shouldRetryAfterError(&Error{HTTPStatus: 500, Message: "boom"}, 100, []string{"claude"}, model, maxWait)
+	if !shouldRetry {
+		t.Fatalf("expected shouldRetry=true for request_retry=-1, got false")
+	}
+	if wait <= 0 {
+		t.Fatalf("expected wait > 0 for unlimited retry, got %v", wait)
+	}
+}
+
+func TestManager_ShouldRetryAfterError_CapsLongCooldownWait(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(-1, 30*time.Second, 0)
+
+	model := "test-model-long-cooldown"
+	next := time.Now().Add(5 * time.Hour)
+	auth := &Auth{
+		ID:       "auth-long-cooldown",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Unavailable:    true,
+				Status:         StatusError,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	_, _, maxWait := m.retrySettings()
+	wait, shouldRetry := m.shouldRetryAfterError(&Error{HTTPStatus: 429, Message: "quota"}, 100, []string{"claude"}, model, maxWait)
+	if !shouldRetry {
+		t.Fatal("expected long cooldown to retry")
+	}
+	if wait != maxWait {
+		t.Fatalf("wait = %v, want maxWait %v", wait, maxWait)
+	}
+}
+
+func TestManager_ExecuteStream_LongCooldownReturnsStreamImmediately(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	m.SetRetryConfig(-1, 200*time.Millisecond, 0)
+	m.RegisterExecutor(&authFallbackExecutor{id: "claude"})
+
+	model := "test-model-stream-long-cooldown"
+	next := time.Now().Add(5 * time.Hour)
+	auth := &Auth{
+		ID:       "auth-stream-long-cooldown",
+		Provider: "claude",
+		ModelStates: map[string]*ModelState{
+			model: {
+				Unavailable:    true,
+				Status:         StatusError,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "claude", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() { reg.UnregisterClient(auth.ID) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	start := time.Now()
+	result, errStream := m.ExecuteStream(ctx, []string{"claude"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errStream != nil {
+		cancel()
+		t.Fatalf("ExecuteStream error = %v", errStream)
+	}
+	if result == nil || result.Chunks == nil {
+		cancel()
+		t.Fatal("expected stream result with chunks")
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		cancel()
+		t.Fatalf("ExecuteStream returned after %v, want immediate return before cooldown wait", elapsed)
+	}
+
+	cancel()
+	select {
+	case chunk, ok := <-result.Chunks:
+		if ok && chunk.Err == nil {
+			t.Fatalf("expected cancellation error chunk, got %#v", chunk)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for cancellation to close retry stream")
+	}
 }
 
 func TestManager_ShouldRetryAfterError_UsesOAuthModelAliasForCooldown(t *testing.T) {

@@ -1234,7 +1234,9 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
 			}
 		}
 	}
-	readInitialStreamChunks()
+	if StreamingKeepAliveInterval(h.Cfg) <= 0 {
+		readInitialStreamChunks()
+	}
 
 	go func() {
 		defer close(dataChan)

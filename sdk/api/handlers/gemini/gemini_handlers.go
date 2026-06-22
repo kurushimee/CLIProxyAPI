@@ -196,6 +196,13 @@ func (h *GeminiAPIHandler) handleStreamGenerateContent(c *gin.Context, modelName
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	if alt == "" && handlers.StreamingKeepAliveInterval(h.Cfg) > 0 {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardGeminiStream(c, flusher, alt, func(err error) { cliCancel(err) }, dataChan, errChan)
+		return
+	}
 
 	// Peek at the first chunk
 	for {

@@ -477,6 +477,13 @@ func (h *OpenAIAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byt
 		c.Header("Connection", "keep-alive")
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
+	if handlers.StreamingKeepAliveInterval(h.Cfg) > 0 {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.handleStreamResult(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
+		return
+	}
 
 	// Peek at the first chunk to determine success or failure before setting headers
 	for {
@@ -586,6 +593,55 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 
+	done := make(chan struct{})
+	var doneOnce sync.Once
+	stop := func() { doneOnce.Do(func() { close(done) }) }
+	convertedChan := make(chan []byte)
+	startConverter := func(first []byte) {
+		go func() {
+			defer close(convertedChan)
+			if first != nil {
+				if converted := convertChatCompletionsStreamChunkToCompletions(first); converted != nil {
+					select {
+					case <-done:
+						return
+					case convertedChan <- converted:
+					}
+				}
+			}
+			for {
+				select {
+				case <-done:
+					return
+				case chunk, ok := <-dataChan:
+					if !ok {
+						return
+					}
+					converted := convertChatCompletionsStreamChunkToCompletions(chunk)
+					if converted == nil {
+						continue
+					}
+					select {
+					case <-done:
+						return
+					case convertedChan <- converted:
+					}
+				}
+			}
+		}()
+	}
+	if handlers.StreamingKeepAliveInterval(h.Cfg) > 0 {
+		startConverter(nil)
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.handleStreamResult(c, flusher, func(err error) {
+			stop()
+			cliCancel(err)
+		}, convertedChan, errChan)
+		return
+	}
+
 	// Peek at the first chunk
 	for {
 		select {
@@ -626,36 +682,10 @@ func (h *OpenAIAPIHandler) handleCompletionsStreamingResponse(c *gin.Context, ra
 				flusher.Flush()
 			}
 
-			done := make(chan struct{})
-			var doneOnce sync.Once
-			stop := func() { doneOnce.Do(func() { close(done) }) }
+				startConverter(nil)
 
-			convertedChan := make(chan []byte)
-			go func() {
-				defer close(convertedChan)
-				for {
-					select {
-					case <-done:
-						return
-					case chunk, ok := <-dataChan:
-						if !ok {
-							return
-						}
-						converted := convertChatCompletionsStreamChunkToCompletions(chunk)
-						if converted == nil {
-							continue
-						}
-						select {
-						case <-done:
-							return
-						case convertedChan <- converted:
-						}
-					}
-				}
-			}()
-
-			h.handleStreamResult(c, flusher, func(err error) {
-				stop()
+				h.handleStreamResult(c, flusher, func(err error) {
+					stop()
 				cliCancel(err)
 			}, convertedChan, errChan)
 			return

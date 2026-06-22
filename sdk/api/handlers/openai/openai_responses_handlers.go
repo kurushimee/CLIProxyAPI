@@ -494,6 +494,13 @@ func (h *OpenAIResponsesAPIHandler) handleStreamingResponse(c *gin.Context, rawJ
 		c.Header("Access-Control-Allow-Origin", "*")
 	}
 	framer := &responsesSSEFramer{}
+	if handlers.StreamingKeepAliveInterval(h.Cfg) > 0 {
+		setSSEHeaders()
+		handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+		flusher.Flush()
+		h.forwardResponsesStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, framer)
+		return
+	}
 
 	// Peek at the first chunk
 	for {

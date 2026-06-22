@@ -1860,12 +1860,10 @@ func compileAPIKeyModelAliasForModels[T interface {
 }
 
 // SetRetryConfig updates retry attempts, credential retry limit and cooldown wait interval.
+// A negative retry value means unlimited request retries.
 func (m *Manager) SetRetryConfig(retry int, maxRetryInterval time.Duration, maxRetryCredentials int) {
 	if m == nil {
 		return
-	}
-	if retry < 0 {
-		retry = 0
 	}
 	if maxRetryCredentials < 0 {
 		maxRetryCredentials = 0
@@ -2168,6 +2166,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		if !shouldRetry {
 			break
 		}
+		if wait > 0 {
+			return m.retryStreamAfterCooldown(ctx, wait, normalized, req, opts, maxRetryCredentials, maxWait, attempt+1), nil
+		}
 		if errWait := waitForCooldown(ctx, wait); errWait != nil {
 			return nil, errWait
 		}
@@ -2187,6 +2188,51 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
 		return nil, lastErr
 	}
 	return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
+}
+
+func (m *Manager) retryStreamAfterCooldown(ctx context.Context, wait time.Duration, providers []string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, maxRetryCredentials int, maxWait time.Duration, attempt int) *cliproxyexecutor.StreamResult {
+	out := make(chan cliproxyexecutor.StreamChunk)
+	send := func(chunk cliproxyexecutor.StreamChunk) bool {
+		if ctx == nil {
+			out <- chunk
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case out <- chunk:
+			return true
+		}
+	}
+	go func() {
+		defer close(out)
+		for {
+			if errWait := waitForCooldown(ctx, wait); errWait != nil {
+				_ = send(cliproxyexecutor.StreamChunk{Err: errWait})
+				return
+			}
+			result, errStream := m.executeStreamMixedOnce(ctx, providers, req, opts, maxRetryCredentials)
+			if errStream == nil {
+				if result == nil || result.Chunks == nil {
+					return
+				}
+				for chunk := range result.Chunks {
+					if !send(chunk) {
+						discardStreamChunks(result.Chunks)
+						return
+					}
+				}
+				return
+			}
+			wait, ok := m.shouldRetryAfterError(errStream, attempt, providers, req.Model, maxWait)
+			if !ok {
+				_ = send(cliproxyexecutor.StreamChunk{Err: errStream})
+				return
+			}
+			attempt++
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Chunks: out}
 }
 
 type requestToFormatResolver interface {
@@ -3156,9 +3202,6 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 	}
 	now := time.Now()
 	defaultRetry := int(m.requestRetry.Load())
-	if defaultRetry < 0 {
-		defaultRetry = 0
-	}
 	providerSet := make(map[string]struct{}, len(providers))
 	for i := range providers {
 		key := strings.TrimSpace(strings.ToLower(providers[i]))
@@ -3185,10 +3228,7 @@ func (m *Manager) closestCooldownWait(providers []string, model string, attempt 
 		if override, ok := auth.RequestRetryOverride(); ok {
 			effectiveRetry = override
 		}
-		if effectiveRetry < 0 {
-			effectiveRetry = 0
-		}
-		if attempt >= effectiveRetry {
+		if effectiveRetry >= 0 && attempt >= effectiveRetry {
 			continue
 		}
 		checkModel := model
@@ -3216,9 +3256,6 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 		return false
 	}
 	defaultRetry := int(m.requestRetry.Load())
-	if defaultRetry < 0 {
-		defaultRetry = 0
-	}
 	providerSet := make(map[string]struct{}, len(providers))
 	for i := range providers {
 		key := strings.TrimSpace(strings.ToLower(providers[i]))
@@ -3245,10 +3282,7 @@ func (m *Manager) retryAllowed(attempt int, providers []string) bool {
 		if override, ok := auth.RequestRetryOverride(); ok {
 			effectiveRetry = override
 		}
-		if effectiveRetry < 0 {
-			effectiveRetry = 0
-		}
-		if attempt < effectiveRetry {
+		if effectiveRetry < 0 || attempt < effectiveRetry {
 			return true
 		}
 	}
@@ -3272,7 +3306,7 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 	wait, found := m.closestCooldownWait(providers, model, attempt)
 	if found {
 		if wait > maxWait {
-			return 0, false
+			return maxWait, true
 		}
 		return wait, true
 	}
@@ -3283,8 +3317,11 @@ func (m *Manager) shouldRetryAfterError(err error, attempt int, providers []stri
 		return 0, false
 	}
 	retryAfter := retryAfterFromError(err)
-	if retryAfter == nil || *retryAfter <= 0 || *retryAfter > maxWait {
+	if retryAfter == nil || *retryAfter <= 0 {
 		return 0, false
+	}
+	if *retryAfter > maxWait {
+		return maxWait, true
 	}
 	return *retryAfter, true
 }
