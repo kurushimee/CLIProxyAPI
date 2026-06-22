@@ -2224,7 +2224,7 @@ func (m *Manager) retryStreamAfterCooldown(ctx context.Context, wait time.Durati
 				}
 				return
 			}
-			wait, ok := m.shouldRetryAfterError(errStream, attempt, providers, req.Model, maxWait)
+			wait, ok = m.shouldRetryAfterError(errStream, attempt, providers, req.Model, maxWait)
 			if !ok {
 				_ = send(cliproxyexecutor.StreamChunk{Err: errStream})
 				return
